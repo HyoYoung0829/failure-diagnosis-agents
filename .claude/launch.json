@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "langgraph-studio",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "langgraph", "dev", "--no-browser"],
+      "port": 2024,
+      "url": "https://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2024"
+    }
+  ]
+}

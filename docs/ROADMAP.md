@@ -61,15 +61,21 @@ DB 설계 순서(요구사항 → 엔티티 → 스키마 → CRUD → 트랜잭
 
 ## 4. 노드 구현 — DB의 "CRUD 정의"에 해당
 
-- [ ] 전문가 노드(들): State의 입력 필드를 읽어 각자 LLM 호출 → 전문가별 출력 필드에 기록 (병렬 실행 가능한 구조인지 확인)
-- [ ] 검증 노드: 전문가 의견 종합 + 정답 규칙 함수(MCP 툴) 대조 → 최종 판단 + 일치/불일치 기록
-- [ ] (선택) 컨텍스트 엔지니어링: 전문가 노드에 넘기는 프롬프트를 원시값이 아닌 요약 피처로 구성 (전문가마다 필요한 피처가 다를 수 있음)
+- [x] 전문가 노드 4개 완성 → [nodes.py](../src/failure_diagnosis_agents/nodes.py) (`twf_expert_node`, `hdf_expert_node`, `pwf_expert_node`, `osf_expert_node`)
+  - 공통 패턴: State에서 입력 꺼내기 → 규칙 함수로 fact 계산 → fact의 중간값까지 프롬프트에 포함 → `ExpertVerdict` 구조화 출력 → `ExpertResult` 조립 → `{"expert_results": {"XXX": result}}` 반환
+  - (수정 완료) `osf_expert_node`의 변수명 `type` → `product_type`으로 개명 (내장함수명 겹침 방지)
+- [x] 검증 노드(`verifier_node`) 완성 → [nodes.py](../src/failure_diagnosis_agents/nodes.py)
+  - 확신도 내림차순 정렬 → 전문가별 판정 vs `mcp_fact['triggered']` 대조 (TWF는 특수취급: "구간 밖인데 고장"만 불일치, "구간 안인데 정상"은 정상 판단으로 인정) → 계산된 사실을 LLM에 주고 총평 문장만 생성
+  - 4개 노드 + 검증 노드를 수동으로 이어붙여 실제 LLM 호출로 end-to-end 확인 완료
+  - 버그 발견/수정: `python-dotenv` 설치만 해두고 `load_dotenv()` 호출이 없어서 `.env`의 API 키를 못 읽던 문제 → `nodes.py` 상단에 추가
+- [x] (선택) 컨텍스트 엔지니어링: 전문가마다 필요한 센서값만 골라 State에서 꺼내고, 규칙함수가 계산한 중간값(temp_diff/power/strain 등)도 프롬프트에 포함해 LLM이 재계산 안 하게 구성 완료
 
 ## 5. 루프 & 라우팅 — DB의 "트랜잭션/조인 로직"에 해당
 
-- [ ] 조건부 엣지: MCP 계산 사실과 불일치한 **해당 전문가만** 재시도로 되돌아가는 라우팅 함수 (다른 전문가는 영향 없음)
-- [x] 재시도 횟수 제한: 전문가별 최대 2회
-- [x] escalate 방침: 2회 초과 시 그 전문가만 "판정 불가 + 사유"로 최종 보고, 나머지 성공한 전문가 결과는 그대로 살려서 출력 (부분 실패 허용, 전체 재시도 아님)
+- [x] 조건부 엣지: `routing_function`이 `expert_results`를 순회하며 불일치(`is_mismatch`)한 전문가만 노드 이름 리스트로 리턴 → `add_conditional_edges`로 등록 → [graph.py](../src/failure_diagnosis_agents/graph.py)
+- [x] 재시도 횟수 제한: 전문가별 최대 2회 — `build_expert_result`가 이전 시도의 `retry_count`를 이어받아 누적 (처음엔 하드코딩 0이라 무한루프 위험 있었던 버그 수정)
+- [x] escalate 방침: 2회 초과 시 그 전문가만 `unresolved=True` + 사유로 최종 보고, 나머지 성공한 전문가 결과는 그대로 살려서 출력 (부분 실패 허용, 전체 재시도 아님)
+- [x] `StateGraph` 조립 + 팬아웃(START→4전문가)/팬인(4전문가→verifier) + `compile()`, 실제 실행으로 정상 케이스 end-to-end 확인 완료
 
 ## 6. MCP 도구 연동
 
@@ -78,9 +84,10 @@ DB 설계 순서(요구사항 → 엔티티 → 스키마 → CRUD → 트랜잭
 
 ## 7. 그래프 조립 & 시각화
 
-- [ ] `StateGraph` 빌드, 노드/엣지 연결, `compile()`
-- [ ] `langgraph dev`로 LangGraph Studio에서 그래프 구조 확인
-- [ ] 루프가 의도대로 도는지 trace로 확인 (LangSmith)
+- [x] `StateGraph` 빌드, 노드/엣지 연결, `compile()` → [graph.py](../src/failure_diagnosis_agents/graph.py)
+- [x] `langgraph dev`로 LangGraph Studio에서 그래프 구조 확인 (`langgraph.json` + `.claude/launch.json` 설정)
+- [x] 실제 데이터셋 케이스(UDI 70, 정답=PWF+OSF 동시 발생)로 실행 → 우리 그래프도 PWF/OSF만 고확신도(0.95)로 정확히 짚어냄, mixture-of-experts 설계가 다중 원인 케이스에서 실제로 작동함을 확인
+- [x] 루프(재시도)가 의도대로 도는지 확인 — temperature=0 LLM이 주어진 fact를 그대로 따라가서 자연스러운 입력으론 불일치가 안 생김(오히려 설계가 잘 됐다는 증거). 그래서 `routing_function`을 LLM 호출 없이 가짜 State로 직접 단위 테스트: (1)특정 전문가만 불일치→그 노드만 재시도 대상 (2)전부 일치→END (3)이미 unresolved인 전문가는 재시도 제외하고 END, 3케이스 모두 통과
 
 ## 8. 평가 (Evaluation)
 

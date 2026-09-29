@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "diagnosis": "./src/failure_diagnosis_agents/graph.py:graph"
+  },
+  "env": ".env"
+}
