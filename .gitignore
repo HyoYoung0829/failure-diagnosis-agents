@@ -152,6 +152,9 @@ activemq-data/
 .envrc
 .venv
 env/
+
+# langgraph dev 로컬 서버가 만드는 임시 데이터
+.langgraph_api/
 venv/
 ENV/
 env.bak/

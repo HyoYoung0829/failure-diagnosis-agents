@@ -79,8 +79,13 @@ DB 설계 순서(요구사항 → 엔티티 → 스키마 → CRUD → 트랜잭
 
 ## 6. MCP 도구 연동
 
-- [ ] 정답 규칙 함수(동력 계산, 임계치 비교)를 MCP 서버로 노출
-- [ ] 진단 에이전트가 직접 산수하지 않고 MCP 툴을 호출하도록 프롬프트/바인딩 구성
+- [x] `rules.py`의 4개 함수를 `@mcp.tool()`로 감싼 MCP 서버 작성 (stdio transport) → [mcp_server.py](../src/failure_diagnosis_agents/mcp_server.py)
+- [x] `MultiServerMCPClient`로 연결 테스트 (`get_tools()`, 툴 1개 직접 호출) → [mcp_client_test.py](../src/failure_diagnosis_agents/mcp_client_test.py)
+- [x] 전문가 4개 노드를 전부 "LLM이 직접 MCP 툴을 호출"하는 구조로 전환 → 공통 로직은 `run_expert_via_mcp()` 헬퍼 하나로 묶음(중복 제거)
+  - 패턴: 사실을 프롬프트에 미리 박아넣지 않고, LLM이 툴 호출 요청(`tool_calls`) → 우리가 대신 실행 → 결과를 대화에 넣고 최종 구조화 판정 받기 (2단계 LLM 호출)
+  - 노드가 전부 `async def`로 바뀜 — LangGraph dev(ASGI 서버)에서 `asyncio.run()`을 노드 안에 중첩 호출하면 블로킹 감지기(`blockbuster`)가 에러 던지는 버그 발견/수정 (노드를 네이티브 async로, `asyncio.run()` 제거)
+  - 부수 변경: 그래프에 async 노드가 생겨서 `.invoke()` 대신 `.ainvoke()` 사용 필요
+- [x] 실제 그래프 전체(`graph.ainvoke`)로 end-to-end 확인, 실제 라벨과 일치 재확인
 
 ## 7. 그래프 조립 & 시각화
 
@@ -91,9 +96,9 @@ DB 설계 순서(요구사항 → 엔티티 → 스키마 → CRUD → 트랜잭
 
 ## 8. 평가 (Evaluation)
 
-- [ ] 데이터셋 일부(또는 전체)를 돌려서 에이전트 진단 vs 실제 라벨(`Machine failure`, 원인 플래그) 비교
-- [ ] 정확도/원인별 정확도 집계
-- [ ] 실패 사례 분석 (에이전트가 왜 틀렸는지 — 루프가 잘 작동했는지 포함)
+- [x] 층화추출 샘플(원인별 10건 + 정상 20건 = 60건)로 평가 → [evaluate.py](../src/failure_diagnosis_agents/evaluate.py)
+- [x] 원인별 정확도 집계 → [docs/evaluation.md](evaluation.md): HDF/PWF/OSF 100%, TWF 83.3%
+- [x] 실패 사례 분석: TWF 오차는 데이터 자체의 확률적 생성 규칙(200~240분 구간 내 무작위 발생)에 기인한 구조적 한계로, 시스템/루프 결함 아님. 재시도 루프는 이번 실행에서 trigger 안 됨(unresolved 없음) — 전문가가 MCP 사실과 매번 일치하는 판정을 냈다는 뜻
 
 ## 9. (선택) 최소 데모
 

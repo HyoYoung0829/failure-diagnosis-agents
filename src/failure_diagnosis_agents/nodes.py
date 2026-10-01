@@ -1,12 +1,25 @@
-import math
+import asyncio
+import json
 from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
-from failure_diagnosis_agents.rules import check_twf, check_hdf, check_pwf, check_osf
 from failure_diagnosis_agents.state import DiagnosisState, ExpertResult, FailureType
 
 load_dotenv()  # .env의 OPENAI_API_KEY 등을 환경변수로 읽어옴
+
+# TWF만 MCP 경유로 바꿔봄 (비교용). 호출될 때마다 서버 프로세스를 새로 띄움 — stdio라 그럼.
+mcp_client = MultiServerMCPClient(
+    {
+        "rules": {
+            "command": "python",
+            "args": ["-m", "failure_diagnosis_agents.mcp_server"],
+            "transport": "stdio",
+        }
+    }
+)
 
 
 # LLM이 채워야 할 부분만 담은 작은 스키마. ExpertResult 전체를 시키면 안 됨
@@ -31,7 +44,9 @@ def build_expert_result(
 ) -> ExpertResult:
     # 4개 전문가 노드가 똑같이 하는 "결과 조립 + 재시도 횟수 이어받기" 로직을 한 곳에 모음
     previous = state["expert_results"].get(failure_type)
-    retry_count = (previous["retry_count"] + 1) if previous else 0  # 이전 시도 횟수를 이어받음
+    retry_count = (
+        (previous["retry_count"] + 1) if previous else 0
+    )  # 이전 시도 횟수를 이어받음
 
     result: ExpertResult = {
         "is_failure": verdict.is_failure,
@@ -46,7 +61,9 @@ def build_expert_result(
     if is_mismatch(failure_type, result) and retry_count >= 2:
         # 2번 재시도(총 3번 시도)까지 계속 불일치하면 포기하고 솔직하게 보고
         result["unresolved"] = True
-        result["unresolved_reason"] = f"{retry_count + 1}번 시도해도 규칙 계산 결과와 계속 불일치"
+        result["unresolved_reason"] = (
+            f"{retry_count + 1}번 시도해도 규칙 계산 결과와 계속 불일치"
+        )
 
     return result
 
@@ -60,53 +77,75 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0).with_structured_output(
 text_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 
-def twf_expert_node(state: DiagnosisState) -> dict:
-    tool_wear_time = state["tool_wear_time"]  # 1. TWF 판단에 필요한 값만 State에서 꺼냄
+async def run_expert_via_mcp(
+    failure_type: FailureType,
+    state: DiagnosisState,
+    tool_name: str,
+    system_prompt: str,
+    human_prompt: str,
+) -> ExpertResult:
+    # 4개 전문가 노드가 공통으로 하는 "MCP 툴 가져와서 LLM한테 쥐어주고, 호출 요청 오면 대신 실행" 로직을 한 곳에 모음
+    tools = await mcp_client.get_tools()
+    tool = next(t for t in tools if t.name == tool_name)
 
-    fact = check_twf(
-        tool_wear_time
-    )  # 2. 규칙 함수로 계산된 사실 확보 (나중엔 MCP 툴 호출로 대체될 자리)
+    llm_with_tool = ChatOpenAI(model="gpt-4o-mini", temperature=0).bind_tools([tool])
+    messages = [SystemMessage(system_prompt), HumanMessage(human_prompt)]
 
-    prompt = (
-        "너는 설비 공구마모고장(TWF) 진단 전문가야. "
-        f"공구 누적 사용 시간은 {tool_wear_time}분이고, "
-        f"규칙 계산 결과 고장 가능 구간(200~240분) 해당 여부는 {fact['triggered']}야. "
-        "이 정보를 바탕으로 고장 여부, 확신도, 근거를 판단해."
+    ai_msg = await llm_with_tool.ainvoke(messages)
+    messages.append(ai_msg)
+
+    fact = None
+    for tool_call in ai_msg.tool_calls:
+        tool_response = await tool.ainvoke(tool_call["args"])
+        fact = json.loads(tool_response[0]["text"])
+        messages.append(ToolMessage(content=str(fact), tool_call_id=tool_call["id"]))
+
+    assert fact is not None, f"LLM이 {tool_name} 툴을 호출하지 않음"
+
+    verdict: ExpertVerdict = await llm.ainvoke(messages)
+
+    return build_expert_result(failure_type, state, fact, verdict)
+
+
+async def twf_expert_node(state: DiagnosisState) -> dict:
+    tool_wear_time = state["tool_wear_time"]
+
+    result = await run_expert_via_mcp(
+        "TWF",
+        state,
+        tool_name="twf_check",
+        system_prompt=(
+            "너는 설비 공구마모고장(TWF) 진단 전문가야. "
+            "판단하기 전에 반드시 twf_check 툴을 호출해서 규칙 계산 결과를 확인해."
+        ),
+        human_prompt=f"공구 누적 사용 시간은 {tool_wear_time}분이야.",
     )
-    verdict: ExpertVerdict = llm.invoke(
-        prompt
-    )  # 3. LLM에게 사실+원시값을 주고 구조화된 판정을 받음
 
-    result = build_expert_result("TWF", state, fact, verdict)  # 4. 결과 조립 (재시도 횟수 이어받기 포함)
-
-    return {
-        "expert_results": {"TWF": result}
-    }  # 5. State 전체가 아니라 "바뀐 부분만" 반환 → reducer가 merge
+    return {"expert_results": {"TWF": result}}
 
 
 # --------------------------------------------------------------------------------------------------------------
 
 
-def hdf_expert_node(state: DiagnosisState) -> dict:
+async def hdf_expert_node(state: DiagnosisState) -> dict:
     air_temperature = state["air_temperature"]
     process_temperature = state["process_temperature"]
     rotational_speed = state["rotational_speed"]
 
-    fact = check_hdf(air_temperature, process_temperature, rotational_speed)
-
-    prompt = (
-        "너는 설비 방열고장(HDF) 진단 전문가야. "
-        f"대기온도는 {air_temperature}K이고, "
-        f"공정온도는 {process_temperature}K이고,"
-        f"회전속도는 {rotational_speed}rpm이고,"
-        f"공정온도-대기온도 차이는 {fact['temp_diff']:.2f}K이고, "
-        f"규칙 계산 결과 고장 조건 (공정온도 - 대기온도) < 8.6K AND 회전속도 < 1380rpm 해당 여부는 {fact['triggered']}야. "
-        "이 정보를 바탕으로 고장 여부, 확신도, 근거를 판단해."
+    result = await run_expert_via_mcp(
+        "HDF",
+        state,
+        tool_name="hdf_check",
+        system_prompt=(
+            "너는 설비 방열고장(HDF) 진단 전문가야. "
+            "판단하기 전에 반드시 hdf_check 툴을 호출해서 규칙 계산 결과를 확인해."
+        ),
+        human_prompt=(
+            f"대기온도는 {air_temperature}K이고, "
+            f"공정온도는 {process_temperature}K이고, "
+            f"회전속도는 {rotational_speed}rpm이야."
+        ),
     )
-
-    verdict: ExpertVerdict = llm.invoke(prompt)
-
-    result = build_expert_result("HDF", state, fact, verdict)
 
     return {"expert_results": {"HDF": result}}
 
@@ -114,24 +153,20 @@ def hdf_expert_node(state: DiagnosisState) -> dict:
 # --------------------------------------------------------------------------------------------------------------
 
 
-def pwf_expert_node(state: DiagnosisState) -> dict:
+async def pwf_expert_node(state: DiagnosisState) -> dict:
     torque = state["torque"]
     rotational_speed = state["rotational_speed"]
 
-    fact = check_pwf(torque, rotational_speed)
-
-    prompt = (
-        "너는 설비 동력고장(PWF) 진단 전문가야. "
-        f"토크는 {torque}Nm이고, "
-        f"회전속도는 {rotational_speed}rpm이고,"
-        f"동력은 {fact['power']}W이고, "
-        f"규칙 계산 결과 고장 조건 '동력이 3500W 미만 OR 동력이 9000W 초과' 해당 여부는 {fact['triggered']}야. "
-        "이 정보를 바탕으로 고장 여부, 확신도, 근거를 판단해."
+    result = await run_expert_via_mcp(
+        "PWF",
+        state,
+        tool_name="pwf_check",
+        system_prompt=(
+            "너는 설비 동력고장(PWF) 진단 전문가야. "
+            "판단하기 전에 반드시 pwf_check 툴을 호출해서 규칙 계산 결과를 확인해."
+        ),
+        human_prompt=f"토크는 {torque}Nm이고, 회전속도는 {rotational_speed}rpm이야.",
     )
-
-    verdict: ExpertVerdict = llm.invoke(prompt)
-
-    result = build_expert_result("PWF", state, fact, verdict)
 
     return {"expert_results": {"PWF": result}}
 
@@ -139,27 +174,25 @@ def pwf_expert_node(state: DiagnosisState) -> dict:
 # --------------------------------------------------------------------------------------------------------------
 
 
-def osf_expert_node(state: DiagnosisState) -> dict:
+async def osf_expert_node(state: DiagnosisState) -> dict:
     tool_wear_time = state["tool_wear_time"]
     torque = state["torque"]
     product_type = state["type"]  # 내장함수 type()과 이름 겹치는 걸 피하려고 개명
 
-    fact = check_osf(tool_wear_time, torque, product_type)
-
-    prompt = (
-        "너는 설비 과응력고장(OSF) 진단 전문가야. "
-        f"공구 누적 사용 시간은 {tool_wear_time}min이고, "
-        f"토크는 {torque}Nm이고, "
-        f"제품 등급은 {product_type}이고, "
-        f"공구마모시간×토크로 계산한 응력은 {fact['strain']:.1f}이고, "
-        f"제품 등급 {product_type}의 임계치는 {fact['threshold']}이고, "
-        f"규칙 계산 결과 응력이 임계치를 초과하는지 여부는 {fact['triggered']}야. "
-        "이 정보를 바탕으로 고장 여부, 확신도, 근거를 판단해."
+    result = await run_expert_via_mcp(
+        "OSF",
+        state,
+        tool_name="osf_check",
+        system_prompt=(
+            "너는 설비 과응력고장(OSF) 진단 전문가야. "
+            "판단하기 전에 반드시 osf_check 툴을 호출해서 규칙 계산 결과를 확인해."
+        ),
+        human_prompt=(
+            f"공구 누적 사용 시간은 {tool_wear_time}min이고, "
+            f"토크는 {torque}Nm이고, "
+            f"제품 등급은 {product_type}이야."
+        ),
     )
-
-    verdict: ExpertVerdict = llm.invoke(prompt)
-
-    result = build_expert_result("OSF", state, fact, verdict)
 
     return {"expert_results": {"OSF": result}}
 
@@ -168,17 +201,25 @@ def osf_expert_node(state: DiagnosisState) -> dict:
 
 
 def verifier_node(state: DiagnosisState) -> dict:
-    expert_results = state["expert_results"]  # 1. 4명(또는 그중 완료된) 결과를 통째로 읽음
+    expert_results = state[
+        "expert_results"
+    ]  # 1. 4명(또는 그중 완료된) 결과를 통째로 읽음
 
     # 2. 확신도 내림차순 정렬. 정렬 자체는 그냥 파이썬 로직이라 LLM한테 안 시킴
     sorted_results = sorted(
-        expert_results.items(), key=lambda item: item[1]["confidence_score"], reverse=True
+        expert_results.items(),
+        key=lambda item: item[1]["confidence_score"],
+        reverse=True,
     )
 
     lines = []
     for failure_type, result in sorted_results:
-        if result["unresolved"]:  # 3. 재시도 2회 넘게 실패한 전문가는 판정 불가로 그대로 보고
-            lines.append(f"- {failure_type}: 판정 불가 (사유: {result['unresolved_reason']})")
+        if result[
+            "unresolved"
+        ]:  # 3. 재시도 2회 넘게 실패한 전문가는 판정 불가로 그대로 보고
+            lines.append(
+                f"- {failure_type}: 판정 불가 (사유: {result['unresolved_reason']})"
+            )
             continue
 
         mismatch = is_mismatch(failure_type, result)
@@ -195,12 +236,14 @@ def verifier_node(state: DiagnosisState) -> dict:
         "한두 문장으로 총평을 작성해. 규칙과 불일치하거나 판정 불가한 전문가가 있으면 그 사실도 솔직하게 언급해."
     )
 
-    overall_assessment = text_llm.invoke(prompt).content  # 5. 자연어 총평 생성 (구조화 출력 아님)
+    overall_assessment = text_llm.invoke(
+        prompt
+    ).content  # 5. 자연어 총평 생성 (구조화 출력 아님)
 
     return {"overall_assessment": overall_assessment}  # 6. 바뀐 필드만 반환
 
 
-if __name__ == "__main__":
+async def _main() -> None:
     # 수동 확인용: 실제 LLM 호출이 여러 번 들어가므로 OPENAI_API_KEY 필요
     sample_state: DiagnosisState = {
         "case_id": 1,
@@ -214,10 +257,20 @@ if __name__ == "__main__":
         "overall_assessment": None,
     }
 
-    # 아직 그래프로 안 묶었으니 4개 노드를 수동으로 순서대로 호출해서 State를 직접 합쳐봄
+    # 아직 그래프로 안 묶었으니 노드들을 수동으로 순서대로 호출해서 State를 직접 합쳐봄
+    # 이제 4개 다 MCP 경유(async)라 전부 await
     state = dict(sample_state)
     for node in (twf_expert_node, hdf_expert_node, pwf_expert_node, osf_expert_node):
-        update = node(state)
-        state["expert_results"] = {**state["expert_results"], **update["expert_results"]}
+        update = await node(state)
+        state["expert_results"] = {
+            **state["expert_results"],
+            **update["expert_results"],
+        }
 
     print(verifier_node(state)["overall_assessment"])
+
+
+if __name__ == "__main__":
+    asyncio.run(
+        _main()
+    )  # 여기는 최상위 진입점이라 asyncio.run()을 써도 안전함 (중첩 루프 아님)
